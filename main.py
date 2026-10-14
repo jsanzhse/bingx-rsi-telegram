@@ -8,6 +8,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 RSI_PERIOD = 14
 RSI_LIMIT = float(os.getenv("RSI_LIMIT", "30"))
+SHORT_RSI_LIMIT = float(os.getenv("SHORT_RSI_LIMIT", "70"))
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "80"))
 TIMEFRAMES = [("1h", "1H"), ("4h", "4H"), ("1d", "1D"), ("1w", "1W")]
 SESSION = requests.Session()
@@ -98,7 +99,6 @@ def send_telegram(message):
     body = response.json()
     if not body.get("ok"):
         raise RuntimeError("Telegram no aceptó el mensaje. Verifica el chat ID y el token en GitHub Secrets.")
-
 def main():
     if not TOKEN or not CHAT_ID:
         raise RuntimeError("Configura TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID en GitHub Secrets antes de ejecutar.")
@@ -146,6 +146,7 @@ def main():
     for chunk in chunks:
         send_telegram(chunk)
     print(f"Finalizado. Señales encontradas: {total}; errores: {errors}")
+    
 
 if __name__ == "__main__":
     main()
