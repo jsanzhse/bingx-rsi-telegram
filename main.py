@@ -53,6 +53,32 @@ def get_24h_tickers():
     except Exception:
         return {}
 
+
+def get_last_prices():
+    try:
+        data = get_json("/openApi/swap/v2/quote/ticker")
+        rows = data.get("data", [])
+
+        if isinstance(rows, dict):
+            rows = [rows]
+
+        prices = {}
+
+        for row in rows:
+            symbol = row.get("symbol", "")
+            try:
+                price = float(row.get("lastPrice", 0) or 0)
+                if symbol and price > 0:
+                    prices[symbol] = price
+            except (TypeError, ValueError):
+                pass
+
+        return prices
+
+    except Exception as exc:
+        print(f"Error consultando precios actuales: {exc}")
+        return {}
+        
 def candles(symbol, interval):
     data = get_json("/openApi/swap/v3/quote/klines",
                     {"symbol": symbol, "interval": interval, "limit": 100})
@@ -120,6 +146,7 @@ def main():
                 errors += 1
                 print(f"Error {symbol} {label}: {exc}")
             time.sleep(0.12)
+    prices = get_last_prices()
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     sections = [f"🔎 BingX RSI(14) < {RSI_LIMIT}\nActualizado: {stamp}\nContratos revisados por temporalidad: {len(symbols)}"]
     total = 0
@@ -130,8 +157,20 @@ def main():
         if not results:
             sections.append("Sin contratos por debajo del umbral.")
         else:
-            for value, symbol, price in results:
-                sections.append(f"{symbol} | RSI {value:.2f} | Precio {price:g}")
+    for value, symbol, candle_price in results:
+    live_price = prices.get(symbol)
+
+    if live_price is not None:
+        sections.append(
+            f"{symbol} | RSI {value:.2f} | "
+            f"Último precio {live_price:g}"
+        )
+    else:
+        sections.append(
+            f"{symbol} | RSI {value:.2f} | "
+            f"Cierre de vela {candle_price:g} "
+            "(precio actual no disponible)"
+        )
     sections.append(f"\nNota: señales técnicas, no recomendaciones de compra/venta. Errores de consulta: {errors}.")
     message = "\n".join(sections)
     # Telegram message limit is 4096 chars; split at line boundaries.
