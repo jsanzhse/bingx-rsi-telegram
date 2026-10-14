@@ -304,7 +304,9 @@ def main():
 
             time.sleep(0.12)
 
-    stamp = datetime.now(timezone.utc).strftime(
+    stamp = datetime.now(
+    ZoneInfo("America/Bogota")
+).strftime("%Y-%m-%d %H:%M (hora de Bogotá)")
         "%Y-%m-%d %H:%M UTC"
     )
 
