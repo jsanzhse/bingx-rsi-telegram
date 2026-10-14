@@ -5,188 +5,156 @@ import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-BASE = "https://open-api.bingx.com"
+# ==================================================
+# CONFIGURACION
+# ==================================================
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+BASE_URL = "https://open-api.bingx.com"
+
+TIMEFRAMES = {
+    "1H": "1h",
+    "4H": "4h",
+    "1D": "1d",
+    "1W": "1w",
+}
 
 RSI_PERIOD = 14
-RSI_LIMIT = float(os.getenv("RSI_LIMIT", "30"))
-SHORT_RSI_LIMIT = float(os.getenv("SHORT_RSI_LIMIT", "70"))
-MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "80"))
+LONG_LEVEL = 30
+SHORT_LEVEL = 70
+MAX_SYMBOLS = 80
 
-TIMEFRAMES = [
-    ("1h", "1H"),
-    ("4h", "4H"),
-    ("1d", "1D"),
-    ("1w", "1W"),
-]
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "BingX-RSI-Telegram-Scanner/2.0"
-})
+session = requests.Session()
+session.headers.update({"User-Agent": "BingX-RSI-Scanner/1.0"})
 
+
+# ==================================================
+# CONSULTAS A BINGX
+# ==================================================
 
 def get_json(path, params=None):
-    response = SESSION.get(
-        BASE + path,
-        params=params,
-        timeout=25
-    )
+    url = BASE_URL + path
+    response = session.get(url, params=params, timeout=20)
     response.raise_for_status()
 
-    data = response.json()
+    result = response.json()
 
-    if data.get("code") not in (0, "0", None):
+    if str(result.get("code", "0")) != "0":
         raise RuntimeError(
-            f"BingX API {data.get('code')}: "
-            f"{data.get('msg', '')}"
+            f"BingX API {result.get('code')}: "
+            f"{result.get('msg', 'Error desconocido')}"
         )
 
-    return data
+    return result.get("data", [])
 
 
 def get_symbols():
-    data = get_json(
-        "/openApi/swap/v2/quote/contracts"
-    )
+    data = get_json("/openApi/swap/v2/quote/contracts")
 
-    rows = data.get("data", [])
+    if isinstance(data, dict):
+        data = data.get("data", [])
+
     symbols = []
 
-    for item in rows:
+    for item in data:
         symbol = item.get("symbol", "")
-        status = str(item.get("status", "1")).lower()
-
-        if (
-            symbol.endswith("-USDT")
-            and status in ("1", "true", "trading", "online")
-        ):
-            symbols.append(symbol)
-
-    if not symbols:
-        symbols = [
-            item.get("symbol", "")
-            for item in rows
-            if item.get("symbol", "").endswith("-USDT")
-        ]
-
-    if not symbols:
-        raise RuntimeError(
-            "BingX no devolvió contratos perpetuos USDT."
-        )
-
-    return sorted(set(symbols))
-
-
-def get_24h_tickers():
-    data = get_json(
-        "/openApi/swap/v2/quote/ticker"
-    )
-
-    rows = data.get("data", [])
-
-    if isinstance(rows, dict):
-        rows = [rows]
-
-    volumes = {}
-
-    for row in rows:
-        symbol = row.get("symbol", "")
+        status = str(item.get("status", "1"))
 
         if not symbol.endswith("-USDT"):
             continue
 
+        if status not in ("1", "TRADING", "ONLINE"):
+            continue
+
+        symbols.append(symbol)
+
+    return symbols
+
+
+def get_tickers():
+    data = get_json("/openApi/swap/v2/quote/ticker")
+
+    if isinstance(data, dict):
+        data = data.get("data", [])
+
+    tickers = {}
+
+    for item in data:
+        symbol = item.get("symbol")
+        if not symbol:
+            continue
+
         try:
+            price = float(item.get("lastPrice", 0) or 0)
             volume = float(
-                row.get("quoteVolume", 0) or 0
-            )
-            volumes[symbol] = volume
-        except (TypeError, ValueError):
-            continue
-
-    return volumes
-
-
-def get_last_prices():
-    data = get_json(
-        "/openApi/swap/v2/quote/ticker"
-    )
-
-    rows = data.get("data", [])
-
-    if isinstance(rows, dict):
-        rows = [rows]
-
-    prices = {}
-
-    for row in rows:
-        symbol = row.get("symbol", "")
-
-        try:
-            price = float(
-                row.get("lastPrice", 0) or 0
+                item.get("quoteVolume", 0)
+                or item.get("volume", 0)
+                or 0
             )
 
-            if symbol and price > 0:
-                prices[symbol] = price
-
-        except (TypeError, ValueError):
+            if price > 0:
+                tickers[symbol] = {
+                    "price": price,
+                    "volume": volume,
+                }
+        except (ValueError, TypeError):
             continue
 
-    return prices
+    return tickers
 
 
-def candles(symbol, interval):
+def get_closes(symbol, interval):
     data = get_json(
         "/openApi/swap/v3/quote/klines",
         {
             "symbol": symbol,
             "interval": interval,
             "limit": 100,
-        }
+        },
     )
 
-    rows = data.get("data", [])
-    parsed = []
+    if isinstance(data, dict):
+        data = data.get("data", [])
 
-    for row in rows:
+    candles = []
+
+    for candle in data:
         try:
-            if isinstance(row, dict):
-                close = float(row["close"])
-                open_time = int(
-                    row.get("time", row.get("openTime", 0))
-                    or 0
+            if isinstance(candle, dict):
+                close = float(candle["close"])
+                timestamp = int(
+                    candle.get("time", candle.get("timestamp", 0))
                 )
-            elif isinstance(row, list) and len(row) > 4:
-                open_time = int(row[0])
-                close = float(row[4])
             else:
-                continue
+                timestamp = int(candle[0])
+                close = float(candle[4])
 
-            parsed.append((open_time, close))
+            candles.append((timestamp, close))
 
-        except (TypeError, ValueError, KeyError):
+        except (ValueError, TypeError, KeyError, IndexError):
             continue
 
-    # Orden cronológico para calcular correctamente el RSI.
-    parsed.sort(key=lambda item: item[0])
-
-    return [close for _, close in parsed]
+    candles.sort(key=lambda item: item[0])
+    return [item[1] for item in candles]
 
 
-def rsi(values, period=14):
-    if len(values) < period + 1:
+# ==================================================
+# CALCULO RSI (METODO WILDER)
+# ==================================================
+
+def calculate_rsi(closes, period=14):
+    if len(closes) < period + 1:
         return None
 
-    gains = []
-    losses = []
+    changes = [
+        closes[i] - closes[i - 1]
+        for i in range(1, len(closes))
+    ]
 
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
+    gains = [max(change, 0) for change in changes]
+    losses = [max(-change, 0) for change in changes]
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
@@ -201,201 +169,218 @@ def rsi(values, period=14):
         ) / period
 
     if avg_loss == 0:
-        return 50.0 if avg_gain == 0 else 100.0
+        return 100.0 if avg_gain > 0 else 50.0
 
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    relative_strength = avg_gain / avg_loss
+    return 100 - (100 / (1 + relative_strength))
 
+
+# ==================================================
+# TELEGRAM
+# ==================================================
 
 def send_telegram(message):
-    if not TOKEN or not CHAT_ID:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError(
-            "Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID "
-            "en GitHub Secrets."
+            "Faltan los secretos TELEGRAM_BOT_TOKEN "
+            "o TELEGRAM_CHAT_ID en GitHub."
         )
 
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
-    response = SESSION.post(
-        url,
-        json={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": True,
-        },
-        timeout=25,
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_TOKEN
+        + "/sendMessage"
     )
 
-    response.raise_for_status()
-    body = response.json()
+    # Telegram limita el texto de cada mensaje.
+    chunks = []
+    while len(message) > 3900:
+        split_at = message.rfind("\n", 0, 3900)
+        if split_at < 1:
+            split_at = 3900
 
-    if not body.get("ok"):
-        raise RuntimeError(
-            "Telegram rechazó el mensaje. "
-            "Revisa los Secrets y el chat ID."
+        chunks.append(message[:split_at])
+        message = message[split_at:].lstrip("\n")
+
+    if message:
+        chunks.append(message)
+
+    for chunk in chunks:
+        response = session.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+            },
+            timeout=20,
         )
+        response.raise_for_status()
 
+        result = response.json()
+        if not result.get("ok"):
+            raise RuntimeError(
+                "Telegram rechazó el mensaje: "
+                + str(result)
+            )
+
+
+# ==================================================
+# FORMATO DE PRECIOS
+# ==================================================
+
+def format_price(price):
+    if price >= 1000:
+        return f"{price:,.2f}"
+    if price >= 1:
+        return f"{price:.4f}"
+    if price >= 0.01:
+        return f"{price:.6f}"
+    return f"{price:.8f}"
+
+
+# ==================================================
+# ESCANEO PRINCIPAL
+# ==================================================
 
 def main():
-    if not TOKEN or not CHAT_ID:
-        raise RuntimeError(
-            "Configura TELEGRAM_BOT_TOKEN y "
-            "TELEGRAM_CHAT_ID en GitHub Secrets."
-        )
+    print("Iniciando escáner RSI de BingX...")
 
-    print("Obteniendo contratos de BingX...")
-
+    print("Obteniendo contratos...")
     symbols = get_symbols()
 
-    try:
-        volumes = get_24h_tickers()
-        if volumes:
-            symbols.sort(
-                key=lambda symbol: volumes.get(symbol, 0),
-                reverse=True,
-            )
-    except Exception as exc:
-        print(f"Aviso: no se pudo ordenar por volumen: {exc}")
+    print("Consultando precios y volumen...")
+    tickers = get_tickers()
+
+    # Priorizar contratos con mayor volumen disponible.
+    symbols = [
+        symbol for symbol in symbols
+        if symbol in tickers
+    ]
+
+    symbols.sort(
+        key=lambda symbol: tickers[symbol]["volume"],
+        reverse=True,
+    )
 
     symbols = symbols[:MAX_SYMBOLS]
 
     print(f"Contratos seleccionados: {len(symbols)}")
-    print("Consultando precios actuales...")
-
-    prices = get_last_prices()
 
     found = {
-        label: {"LONG": [], "SHORT": []}
-        for _, label in TIMEFRAMES
+        timeframe: {"LONG": [], "SHORT": []}
+        for timeframe in TIMEFRAMES
     }
 
     errors = 0
 
-    for interval, label in TIMEFRAMES:
+    for label, interval in TIMEFRAMES.items():
         print(f"Analizando temporalidad {label}...")
 
-        for symbol in symbols:
+        for index, symbol in enumerate(symbols, start=1):
             try:
-                closes = candles(symbol, interval)
-                value = rsi(closes, RSI_PERIOD)
+                closes = get_closes(symbol, interval)
+                value = calculate_rsi(closes, RSI_PERIOD)
 
                 if value is None:
+                    print(f"Sin suficientes velas: {symbol} {label}")
                     continue
 
-                # RSI calculado con las velas de BingX.
-                # El precio mostrado se obtiene por separado
-                # del ticker, no del cierre de la vela.
+                price = tickers[symbol]["price"]
 
-                if value <= RSI_LIMIT:
-                    found[label]["LONG"].append(
-                        (value, symbol)
+                signal = None
+
+                if value <= LONG_LEVEL:
+                    signal = "LONG"
+                elif value >= SHORT_LEVEL:
+                    signal = "SHORT"
+
+                if signal:
+                    found[label][signal].append({
+                        "symbol": symbol,
+                        "rsi": value,
+                        "price": price,
+                    })
+
+                if index % 20 == 0:
+                    print(
+                        f"{label}: revisados {index}/"
+                        f"{len(symbols)} contratos"
                     )
 
-                elif value >= SHORT_RSI_LIMIT:
-                    found[label]["SHORT"].append(
-                        (value, symbol)
-                    )
-
-            except Exception as exc:
+            except Exception as error:
                 errors += 1
                 print(
-                    f"Error en {symbol} {label}: {exc}"
+                    f"Error en {symbol} {label}: {error}"
                 )
 
-            time.sleep(0.12)
+            # Pausa corta para reducir solicitudes demasiado rápidas.
+            time.sleep(0.05)
 
     stamp = datetime.now(
-    ZoneInfo("America/Bogota")
-).strftime("%Y-%m-%d %H:%M (hora de Bogotá)")
-        "%Y-%m-%d %H:%M UTC"
-    )
+        ZoneInfo("America/Bogota")
+    ).strftime("%Y-%m-%d %H:%M")
 
-    sections = [
+    lines = [
         "🔎 ESCÁNER RSI(14) — BINGX FUTUROS USDT",
-        f"Actualizado: {stamp}",
-        f"Contratos seleccionados: {len(symbols)}",
-        f"🟢 LONG: RSI <= {RSI_LIMIT}",
-        f"🔴 SHORT: RSI >= {SHORT_RSI_LIMIT}",
-        "Precio: último precio negociado consultado a BingX.",
+        f"🕒 Hora de Bogotá: {stamp}",
+        f"📊 Contratos analizados: {len(symbols)}",
+        "📌 LONG: RSI ≤ 30 | SHORT: RSI ≥ 70",
+        "",
+        "⚠️ Alertas informativas; no son órdenes de trading.",
     ]
 
-    total_long = 0
-    total_short = 0
+    total_signals = 0
 
-    for _, label in TIMEFRAMES:
-        sections.append(f"\n📊 TEMPORALIDAD {label}")
+    for timeframe in TIMEFRAMES:
+        lines.append("")
+        lines.append(f"━━━━━━━━ {timeframe} ━━━━━━━━")
 
-        for direction in ("LONG", "SHORT"):
-            results = found[label][direction]
-
-            results.sort(
-                key=lambda item: item[0],
-                reverse=(direction == "SHORT"),
-            )
-
-            sections.append(
-                f"\n{'🟢' if direction == 'LONG' else '🔴'} "
-                f"{direction} — {len(results)} señales"
-            )
-
-            if direction == "LONG":
-                total_long += len(results)
-            else:
-                total_short += len(results)
+        for signal, title in (
+            ("LONG", "🟢 LONG — RSI bajo"),
+            ("SHORT", "🔴 SHORT — RSI alto"),
+        ):
+            results = found[timeframe][signal]
+            lines.append("")
+            lines.append(f"{title}: {len(results)}")
 
             if not results:
-                sections.append(
-                    "Sin señales en este momento."
-                )
+                lines.append("Sin señales en este momento.")
                 continue
 
-            for value, symbol in results:
-                live_price = prices.get(symbol)
-
-                if live_price is not None:
-                    price_text = f"Último precio {live_price:g}"
-                else:
-                    price_text = "Último precio no disponible"
-
-                sections.append(
-                    f"{symbol} | RSI {value:.2f} | "
-                    f"{price_text}"
+            # Mostrar primero los RSI más extremos.
+            if signal == "LONG":
+                results.sort(key=lambda item: item["rsi"])
+            else:
+                results.sort(
+                    key=lambda item: item["rsi"],
+                    reverse=True,
                 )
 
-    sections.append(
-        "\nNota: señales técnicas, no recomendaciones "
-        "de compra o venta. El RSI no garantiza movimientos."
-    )
+            for item in results:
+                lines.append(
+                    f"{item['symbol']} | "
+                    f"RSI: {item['rsi']:.2f} | "
+                    f"Precio: {format_price(item['price'])} USDT"
+                )
+                total_signals += 1
 
-    sections.append(
-        f"Errores de consulta de velas: {errors}."
-    )
+    lines.extend([
+        "",
+        f"📍 Total de señales encontradas: {total_signals}",
+        f"⚠️ Errores de consulta: {errors}",
+        "",
+        "El RSI puede cambiar antes del cierre de la vela. "
+        "Confirma la señal en BingX antes de operar.",
+    ])
 
-    message = "\n".join(sections)
+    report = "\n".join(lines)
 
-    # Dividir los mensajes para respetar el límite de Telegram.
-    chunks = []
-    current = ""
+    print(report)
+    send_telegram(report)
 
-    for line in message.splitlines():
-        if len(current) + len(line) + 1 > 3800:
-            if current:
-                chunks.append(current)
-            current = ""
-
-        current += line + "\n"
-
-    if current:
-        chunks.append(current)
-
-    for chunk in chunks:
-        send_telegram(chunk)
-
-    print(
-        f"Escaneo finalizado. LONG: {total_long}; "
-        f"SHORT: {total_short}; errores: {errors}"
-    )
+    print("Reporte enviado a Telegram.")
 
 
 if __name__ == "__main__":
     main()
+    
