@@ -2,7 +2,8 @@
 import os
 import time
 import requests
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 BASE = "https://open-api.bingx.com"
 
