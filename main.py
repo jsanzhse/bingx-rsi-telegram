@@ -99,6 +99,7 @@ def get_tickers():
                     "price": price,
                     "volume": volume,
                 }
+
         except (ValueError, TypeError):
             continue
 
@@ -176,6 +177,24 @@ def calculate_rsi(closes, period=14):
 
 
 # ==================================================
+# NOMBRES CORTOS DE LOS PARES
+# ==================================================
+
+def short_symbol(symbol):
+    # Ejemplo: NCSKSKHYNIX2USD-USDT -> SKHYNIX
+    if symbol.startswith("NCSK") and "2USD-USDT" in symbol:
+        name = symbol[len("NCSK"):]
+        name = name.replace("2USD-USDT", "")
+        return name
+
+    # Ejemplo: ICNT-USDT -> ICNT
+    if symbol.endswith("-USDT"):
+        return symbol[:-5]
+
+    return symbol
+
+
+# ==================================================
 # TELEGRAM
 # ==================================================
 
@@ -192,10 +211,11 @@ def send_telegram(message):
         + "/sendMessage"
     )
 
-    # Telegram limita el texto de cada mensaje.
     chunks = []
+
     while len(message) > 3900:
         split_at = message.rfind("\n", 0, 3900)
+
         if split_at < 1:
             split_at = 3900
 
@@ -214,13 +234,13 @@ def send_telegram(message):
             },
             timeout=20,
         )
-        response.raise_for_status()
 
+        response.raise_for_status()
         result = response.json()
+
         if not result.get("ok"):
             raise RuntimeError(
-                "Telegram rechazó el mensaje: "
-                + str(result)
+                "Telegram rechazó el mensaje: " + str(result)
             )
 
 
@@ -231,10 +251,13 @@ def send_telegram(message):
 def format_price(price):
     if price >= 1000:
         return f"{price:,.2f}"
+
     if price >= 1:
         return f"{price:.4f}"
+
     if price >= 0.01:
         return f"{price:.6f}"
+
     return f"{price:.8f}"
 
 
@@ -282,11 +305,12 @@ def main():
                 value = calculate_rsi(closes, RSI_PERIOD)
 
                 if value is None:
-                    print(f"Sin suficientes velas: {symbol} {label}")
+                    print(
+                        f"Sin suficientes velas: {symbol} {label}"
+                    )
                     continue
 
                 price = tickers[symbol]["price"]
-
                 signal = None
 
                 if value <= LONG_LEVEL:
@@ -313,7 +337,7 @@ def main():
                     f"Error en {symbol} {label}: {error}"
                 )
 
-            # Pausa corta para reducir solicitudes demasiado rápidas.
+            # Pausa corta entre consultas.
             time.sleep(0.05)
 
     stamp = datetime.now(
@@ -340,6 +364,7 @@ def main():
             ("SHORT", "🔴 SHORT — RSI alto"),
         ):
             results = found[timeframe][signal]
+
             lines.append("")
             lines.append(f"{title}: {len(results)}")
 
@@ -347,7 +372,7 @@ def main():
                 lines.append("Sin señales en este momento.")
                 continue
 
-            # Mostrar primero los RSI más extremos.
+            # RSI más extremo primero.
             if signal == "LONG":
                 results.sort(key=lambda item: item["rsi"])
             else:
@@ -357,11 +382,14 @@ def main():
                 )
 
             for item in results:
+                display_name = short_symbol(item["symbol"])
+
                 lines.append(
-                    f"{item['symbol']} | "
+                    f"{display_name} | "
                     f"RSI: {item['rsi']:.2f} | "
                     f"Precio: {format_price(item['price'])} USDT"
                 )
+
                 total_signals += 1
 
     lines.extend([
@@ -383,4 +411,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+        
