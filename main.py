@@ -18,6 +18,7 @@ RSI_PERIOD = 14
 MAX_SYMBOLS = 80
 CANDLE_LIMIT = 100
 
+# BingX: temporalidades y valores de intervalo
 TIMEFRAMES = [
     ("1H", "1h"),
     ("4H", "4h"),
@@ -28,90 +29,123 @@ TIMEFRAMES = [
 RSI_LONG = 30
 RSI_SHORT = 70
 
+# Pausa entre consultas de velas para reducir errores por limite.
+KLINE_REQUEST_DELAY = 1.1
+
 SESSION = requests.Session()
 
 
 # ============================================================
-# SOLICITUDES A BINGX
+# CONSULTAS A BINGX
 # ============================================================
 
-def bingx_get(endpoint, params=None):
-    """Consulta un endpoint publico de BingX."""
+def bingx_get(endpoint, params=None, retries=3):
+    """Consulta un endpoint publico de BingX con reintentos."""
 
     url = BINGX_BASE_URL + endpoint
+    last_error = None
 
-    response = SESSION.get(
-        url,
-        params=params or {},
-        timeout=20
-    )
-
-    response.raise_for_status()
-    result = response.json()
-
-    if isinstance(result, dict):
-        code = result.get("code")
-
-        if code is not None and str(code) != "0":
-            raise RuntimeError(
-                f"BingX devolvio codigo {code}: "
-                f"{result.get('msg', 'Error desconocido')}"
+    for attempt in range(retries):
+        try:
+            response = SESSION.get(
+                url,
+                params=params or {},
+                timeout=25
             )
 
-        return result.get("data", [])
+            response.raise_for_status()
+            result = response.json()
 
-    return result
+            if not isinstance(result, dict):
+                return result
+
+            code = result.get("code")
+
+            if code is not None and str(code) != "0":
+                message = result.get("msg", "Error desconocido")
+                raise RuntimeError(
+                    f"BingX codigo {code}: {message}"
+                )
+
+            if "data" not in result:
+                raise RuntimeError(
+                    f"BingX no devolvio el campo data: {result}"
+                )
+
+            return result["data"]
+
+        except Exception as exc:
+            last_error = exc
+
+            if attempt < retries - 1:
+                wait_seconds = 2 ** (attempt + 1)
+                print(
+                    f"Consulta fallida ({attempt + 1}/{retries}) "
+                    f"en {endpoint}: {exc}. "
+                    f"Reintentando en {wait_seconds} s."
+                )
+                time.sleep(wait_seconds)
+
+    raise RuntimeError(
+        f"Fallo despues de {retries} intentos: {last_error}"
+    )
 
 
 # ============================================================
-# OBTENER MERCADOS Y PRECIOS
+# MERCADOS Y PRECIOS
 # ============================================================
 
 def get_market_tickers():
-    """Obtiene los tickers de futuros perpetuos disponibles."""
-
     data = bingx_get("/openApi/swap/v2/quote/ticker")
 
     if isinstance(data, dict):
-        data = [data]
+        # Si BingX devuelve un unico ticker, lo convertimos en lista.
+        if "symbol" in data:
+            return [data]
 
-    if not isinstance(data, list):
-        raise RuntimeError("BingX no devolvio una lista de tickers.")
+        # Compatibilidad con respuestas envueltas.
+        for key in ("list", "rows", "tickers", "data"):
+            if isinstance(data.get(key), list):
+                return data[key]
 
-    return data
+    if isinstance(data, list):
+        return data
+
+    raise RuntimeError(
+        f"Formato de tickers no reconocido: {type(data).__name__}"
+    )
 
 
 def get_top_symbols():
-    """
-    Selecciona hasta 80 contratos USDT.
-    Prioriza los de mayor volumen negociado.
-    """
+    """Selecciona los contratos USDT con mayor volumen disponible."""
 
     tickers = get_market_tickers()
     markets = {}
 
     for ticker in tickers:
+        if not isinstance(ticker, dict):
+            continue
+
         symbol = str(ticker.get("symbol", "")).upper()
 
-        # Solo contratos cotizados en USDT.
         if not symbol.endswith("-USDT"):
             continue
 
-        # Excluir contratos sin precio valido.
         try:
-            price = float(ticker.get("lastPrice", 0))
+            price = float(ticker.get("lastPrice", 0) or 0)
         except (TypeError, ValueError):
             continue
 
         if price <= 0:
             continue
 
-        # Preferir volumen cotizado en USDT cuando exista.
         volume = 0.0
 
+        # Preferir volumen cotizado, si está disponible.
         for field in ("quoteVolume", "turnover", "volume"):
             try:
                 value = float(ticker.get(field, 0) or 0)
+
                 if value > 0:
                     volume = value
                     break
@@ -134,14 +168,11 @@ def get_top_symbols():
 
 
 # ============================================================
-# NOMBRES CORTOS PARA MOSTRAR EN TELEGRAM
+# NOMBRES CORTOS PARA TELEGRAM
 # ============================================================
 
 def short_symbol(symbol):
-    """
-    Acorta los nombres especiales solo para mostrarlos.
-    El simbolo original se conserva para consultar BingX.
-    """
+    """Acorta nombres especiales solo para mostrarlos."""
 
     base = (
         symbol[:-5]
@@ -149,21 +180,28 @@ def short_symbol(symbol):
         else symbol
     )
 
-    # Acciones e indices tokenizados.
+    # Acciones tokenizadas: NCSKTSLA2USD -> TSLA
+    if base.startswith("NCSK") and base.endswith("2USD"):
+        return base[4:-4]
+
+    # Indices tokenizados: NCSINASDAQ1002USD -> NASDAQ100
     if base.startswith("NCSI") and base.endswith("2USD"):
         return base[4:-4]
 
-    # Materias primas: Brent y WTI, entre otras.
-    if base.startswith("NCC010IL") and base.endswith("2USD"):
-        return base[len("NCC010IL"):-4]
+    # Materias primas: NCCO1OILBRENT2USD -> BRENT
+    if base.startswith("NCCO") and base.endswith("2USD"):
+        name = base[4:-4]
+
+        if name.startswith("1OIL"):
+            name = name[4:]
+        elif name.startswith("010IL"):
+            name = name[5:]
+
+        return name
 
     # Pares especiales de divisas.
     if base.startswith("NCFX") and base.endswith("2GBP"):
         return base[4:-4] + "GBP"
-
-    # Acciones tokenizadas identificadas anteriormente.
-    if base.startswith("NCSK") and base.endswith("2USD"):
-        return base[4:-4]
 
     return base
 
@@ -173,7 +211,7 @@ def short_symbol(symbol):
 # ============================================================
 
 def calculate_rsi(closes, period=14):
-    """Calcula el RSI usando el suavizado de Wilder."""
+    """Calcula RSI usando el suavizado de Wilder."""
 
     if len(closes) <= period:
         return None
@@ -209,11 +247,73 @@ def calculate_rsi(closes, period=14):
 
     relative_strength = avg_gain / avg_loss
 
-    return 100.0 - (100.0 / (1.0 + relative_strength))
+    return 100.0 - (
+        100.0 / (1.0 + relative_strength)
+    )
+
+
+# ============================================================
+# LECTURA DE VELAS
+# ============================================================
+
+def extract_candles(data):
+    """Acepta respuestas con velas en listas o diccionarios."""
+
+    if isinstance(data, dict):
+        for key in ("klines", "list", "rows", "data"):
+            if isinstance(data.get(key), list):
+                return data[key]
+
+        # Algunos formatos pueden devolver una sola vela.
+        if any(
+            key in data
+            for key in ("close", "c", "closePrice")
+        ):
+            return [data]
+
+        raise RuntimeError(
+            "Respuesta de velas sin una lista reconocible. "
+            f"Campos recibidos: {list(data.keys())}"
+        )
+
+    if isinstance(data, list):
+        return data
+
+    raise RuntimeError(
+        "Formato de velas inesperado: "
+        f"{type(data).__name__}"
+    )
+
+
+def extract_close(candle):
+    """Extrae el cierre sin asumir un único formato."""
+
+    if isinstance(candle, dict):
+        for key in ("close", "c", "closePrice"):
+            if candle.get(key) is not None:
+                return float(candle[key])
+
+        raise ValueError(
+            "No se encontro el precio de cierre. "
+            f"Campos: {list(candle.keys())}"
+        )
+
+    if isinstance(candle, (list, tuple)):
+        if len(candle) > 4:
+            return float(candle[4])
+
+        raise ValueError(
+            f"La vela tiene {len(candle)} campos; "
+            "se esperaban al menos 5."
+        )
+
+    raise ValueError(
+        f"Tipo de vela no reconocido: {type(candle).__name__}"
+    )
 
 
 def get_rsi(symbol, interval):
-    """Descarga velas y calcula el RSI de un contrato."""
+    """Consulta las velas de BingX y calcula su RSI."""
 
     data = bingx_get(
         "/openApi/swap/v3/quote/klines",
@@ -224,20 +324,26 @@ def get_rsi(symbol, interval):
         }
     )
 
-    if not isinstance(data, list) or not data:
-        raise RuntimeError("BingX no devolvio velas.")
+    candles = extract_candles(data)
+
+    if not candles:
+        raise RuntimeError(
+            f"BingX devolvio cero velas para {symbol} {interval}"
+        )
 
     closes = []
 
-    for candle in data:
-        try:
-            # En la respuesta habitual de BingX,
-            # el cierre esta en la posicion 4.
-            close = float(candle[4])
-            if close > 0:
-                closes.append(close)
-        except (TypeError, ValueError, IndexError):
-            continue
+    for candle in candles:
+        close = extract_close(candle)
+
+        if close > 0:
+            closes.append(close)
+
+    if len(closes) <= RSI_PERIOD:
+        raise RuntimeError(
+            f"Solo hay {len(closes)} cierres validos "
+            f"para {symbol} {interval}"
+        )
 
     return calculate_rsi(closes, RSI_PERIOD)
 
@@ -247,8 +353,6 @@ def get_rsi(symbol, interval):
 # ============================================================
 
 def format_price(price):
-    """Evita decimales innecesarios en precios altos."""
-
     if price >= 1000:
         return f"{price:,.2f}"
 
@@ -259,12 +363,10 @@ def format_price(price):
 
 
 # ============================================================
-# ESCANER RSI
+# ESCANEO DE MERCADOS
 # ============================================================
 
 def scan_markets():
-    """Analiza los mercados en las cuatro temporalidades."""
-
     markets = get_top_symbols()
 
     if not markets:
@@ -275,10 +377,8 @@ def scan_markets():
     print(f"Mercados seleccionados: {len(markets)}")
 
     results = {
-        "1H": {"LONG": [], "SHORT": []},
-        "4H": {"LONG": [], "SHORT": []},
-        "1D": {"LONG": [], "SHORT": []},
-        "1W": {"LONG": [], "SHORT": []},
+        label: {"LONG": [], "SHORT": []}
+        for label, _ in TIMEFRAMES
     }
 
     errors = 0
@@ -287,7 +387,6 @@ def scan_markets():
 
     for market in markets:
         symbol = market["symbol"]
-        price = market["price"]
         display_name = short_symbol(symbol)
 
         for timeframe_label, interval in TIMEFRAMES:
@@ -298,15 +397,15 @@ def scan_markets():
 
                 if rsi is None:
                     print(
-                        f"Sin suficientes velas: "
-                        f"{symbol} {timeframe_label}"
+                        f"RSI no disponible: {symbol} "
+                        f"{timeframe_label}"
                     )
                     continue
 
                 item = {
                     "name": display_name,
                     "symbol": symbol,
-                    "price": price,
+                    "price": market["price"],
                     "rsi": rsi,
                 }
 
@@ -319,17 +418,17 @@ def scan_markets():
             except Exception as exc:
                 errors += 1
                 print(
-                    f"Error en {symbol} {timeframe_label}: {exc}"
+                    f"Error en {symbol} {timeframe_label}: "
+                    f"{type(exc).__name__}: {exc}"
                 )
 
-            # Pausa breve para espaciar las solicitudes.
-            time.sleep(0.05)
+            # Respetar el limite de solicitudes de velas.
+            time.sleep(KLINE_REQUEST_DELAY)
 
-        if checked % 20 == 0 or checked == total:
-            print(f"Progreso: {checked}/{total}")
+            if checked % 20 == 0 or checked == total:
+                print(f"Progreso: {checked}/{total}")
 
-    # Ordenar de menor a mayor RSI dentro de cada grupo.
-    for timeframe_label in results:
+    for timeframe_label, _ in TIMEFRAMES:
         results[timeframe_label]["LONG"].sort(
             key=lambda item: item["rsi"]
         )
@@ -342,7 +441,7 @@ def scan_markets():
 
 
 # ============================================================
-# CONSTRUIR INFORME PARA TELEGRAM
+# CONSTRUIR INFORME
 # ============================================================
 
 def build_report(results, market_count, errors):
@@ -352,38 +451,46 @@ def build_report(results, market_count, errors):
     lines = [
         "📊 ESCANER RSI - BINGX",
         f"🕒 Hora Colombia: {timestamp}",
-        f"📈 Mercados analizados: {market_count}",
+        f"📈 Mercados seleccionados: {market_count}",
         f"📐 RSI: periodo {RSI_PERIOD}",
         f"🟢 LONG: RSI <= {RSI_LONG}",
         f"🔴 SHORT: RSI >= {RSI_SHORT}",
         "",
-        "Los resultados son señales del RSI, no ordenes.",
+        "Las señales del RSI no son ordenes de trading.",
     ]
 
     total_signals = 0
 
     for timeframe_label, _ in TIMEFRAMES:
-        lines.append("")
-        lines.append(f"━━━━━━━━ {timeframe_label} ━━━━━━━━")
+        lines.extend([
+            "",
+            f"━━━━━━━━ {timeframe_label} ━━━━━━━━",
+            f"🟢 LONG (RSI <= {RSI_LONG})",
+        ])
 
-        for direction in ("LONG", "SHORT"):
-            signals = results[timeframe_label][direction]
+        long_signals = results[timeframe_label]["LONG"]
 
-            if direction == "LONG":
-                lines.append(f"🟢 LONG (RSI <= {RSI_LONG})")
-            else:
-                lines.append(f"🔴 SHORT (RSI >= {RSI_SHORT})")
-
-            if not signals:
-                lines.append("  Sin señales en este momento.")
-                continue
-
-            total_signals += len(signals)
-
-            for item in signals:
+        if not long_signals:
+            lines.append("  Sin señales detectadas.")
+        else:
+            for item in long_signals:
+                total_signals += 1
                 lines.append(
-                    f"  {item['name']} | "
-                    f"RSI: {item['rsi']:.2f} | "
+                    f"  {item['name']} | RSI: {item['rsi']:.2f} | "
+                    f"Precio: {format_price(item['price'])} USDT"
+                )
+
+        lines.append(f"🔴 SHORT (RSI >= {RSI_SHORT})")
+
+        short_signals = results[timeframe_label]["SHORT"]
+
+        if not short_signals:
+            lines.append("  Sin señales detectadas.")
+        else:
+            for item in short_signals:
+                total_signals += 1
+                lines.append(
+                    f"  {item['name']} | RSI: {item['rsi']:.2f} | "
                     f"Precio: {format_price(item['price'])} USDT"
                 )
 
@@ -392,7 +499,7 @@ def build_report(results, market_count, errors):
         f"🔎 Total de señales: {total_signals}",
         f"⚠️ Consultas con error: {errors}",
         "",
-        "Aviso: verifica el grafico antes de operar.",
+        "Verifica el grafico antes de operar.",
         "El RSI por si solo no confirma una entrada.",
     ])
 
@@ -400,11 +507,11 @@ def build_report(results, market_count, errors):
 
 
 # ============================================================
-# ENVIAR MENSAJES A TELEGRAM
+# ENVIO A TELEGRAM
 # ============================================================
 
 def split_message(message, max_length=3500):
-    """Divide informes largos sin cortar las lineas."""
+    """Divide mensajes largos para respetar el limite de Telegram."""
 
     chunks = []
     current = ""
@@ -425,12 +532,10 @@ def split_message(message, max_length=3500):
 
 
 def send_telegram(message):
-    """Envia el informe y verifica la respuesta de Telegram."""
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError(
-            "Faltan los secretos TELEGRAM_BOT_TOKEN "
-            "o TELEGRAM_CHAT_ID en GitHub."
+            "Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID "
+            "en los secretos de GitHub."
         )
 
     url = (
@@ -449,7 +554,7 @@ def send_telegram(message):
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": chunk,
             },
-            timeout=20,
+            timeout=25,
         )
 
         response.raise_for_status()
@@ -457,7 +562,7 @@ def send_telegram(message):
 
         if not result.get("ok"):
             raise RuntimeError(
-                "Telegram no acepto el mensaje: "
+                "Telegram rechazo el mensaje: "
                 f"{result.get('description', 'Error desconocido')}"
             )
 
@@ -470,7 +575,7 @@ def send_telegram(message):
 
 
 # ============================================================
-# EJECUCION PRINCIPAL
+# INICIO DEL PROGRAMA
 # ============================================================
 
 def main():
@@ -495,6 +600,15 @@ def main():
 
     print("\n" + report + "\n")
 
+    # Evitar presentar un informe de cero señales como confiable
+    # si absolutamente todas las consultas fallaron.
+    if errors == market_count * len(TIMEFRAMES):
+        raise RuntimeError(
+            "Todas las consultas de RSI fallaron. "
+            "No se enviara un informe de señales como si fuera valido. "
+            "Revisa los errores anteriores."
+        )
+
     send_telegram(report)
 
     print("Proceso finalizado correctamente.")
@@ -502,4 +616,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
