@@ -67,6 +67,13 @@ def short_symbol(symbol):
 
         return name
 
+        # Pares de divisas NCFX
+    if base.startswith("NCFX") and base.endswith("2USD"):
+        name = base[4:-4]
+
+        # Ejemplo: NCFXEURSGD2USD -> EURSGD
+        return name
+
     if base.startswith("NCFX") and base.endswith("2GBP"):
         return base[4:-4] + "GBP"
 
